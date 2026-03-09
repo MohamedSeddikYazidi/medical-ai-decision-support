@@ -52,10 +52,18 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ── MLflow config ──────────────────────────────────────────────────────────────
 def _mlflow_local_uri(path: str) -> str:
+    """
+    Build a file:// URI that works on both Windows and Unix.
+    pathlib.Path.as_uri() produces the correct format on every OS:
+      Windows ->  file:///C:/Users/foo/mlruns
+      Unix    ->  file:///home/foo/mlruns
+    """
     from pathlib import Path
     return Path(os.path.abspath(path)).as_uri()
 
-MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", _mlflow_local_uri(MODEL_DIR))
+MLRUNS_DIR = os.path.join(BASE_DIR, "mlruns")
+os.makedirs(MLRUNS_DIR, exist_ok=True)
+MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", _mlflow_local_uri(MLRUNS_DIR))
 EXPERIMENT_NAME = "diabetes_readmission_v1"
 
 
@@ -84,7 +92,7 @@ def train_model(
     y_train: np.ndarray,
     X_val: np.ndarray,
     y_val: np.ndarray,
-    cv_folds: int = 5,
+    cv_folds: int = 3,  # 3 folds = 40% faster than 5; increase with --full
     random_state: int = 42,
 ) -> Tuple[object, Dict[str, float], Dict]:
     """
@@ -172,10 +180,18 @@ def _grid_size(param_grid: dict) -> int:
 # Quick grid (for CI / demo)
 # ─────────────────────────────────────────────────────────────────────────────
 def get_quick_param_grids() -> Dict[str, dict]:
+    """
+    Fast grid designed to finish in ~5-10 min on 100k rows.
+    Each model has exactly 1-4 combinations x 3 CV folds = very fast.
+    Use python train.py          for this fast mode (default).
+    Use python train.py --full   for the complete search grid.
+    """
     return {
         "logistic_regression": {"C": [0.1, 1.0], "penalty": ["l2"]},
-        "random_forest": {"n_estimators": [100], "max_depth": [10], "max_features": ["sqrt"]},
-        "xgboost": {"n_estimators": [100], "max_depth": [3], "learning_rate": [0.1], "scale_pos_weight": [5]},
+        "random_forest":       {"n_estimators": [100], "max_depth": [8],
+                                "max_features": ["sqrt"], "n_jobs": [-1]},
+        "xgboost":             {"n_estimators": [100], "max_depth": [4],
+                                "learning_rate": [0.1], "scale_pos_weight": [8]},
     }
 
 
@@ -202,7 +218,7 @@ def _check_dependencies() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 # Main training orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
-def run_training(quick: bool = False, random_state: int = 42) -> str:
+def run_training(quick: bool = True, random_state: int = 42, cv_folds: int = 3) -> str:
     """
     Full end-to-end training run.
 
@@ -253,6 +269,7 @@ def run_training(quick: bool = False, random_state: int = 42) -> str:
                 y_train=y_train,
                 X_val=X_val,
                 y_val=y_val,
+                cv_folds=cv_folds,
                 random_state=random_state,
             )
             results[name] = {
@@ -347,8 +364,18 @@ def run_training(quick: bool = False, random_state: int = 42) -> str:
 
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--quick", action="store_true",
-                        help="Use compact hyperparameter grids (for CI / demo).")
+    parser = argparse.ArgumentParser(
+        description="Train diabetes readmission models."
+    )
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Run the complete hyperparameter grid (slow, use after quick run works)."
+    )
+    parser.add_argument(
+        "--cv", type=int, default=3,
+        help="Number of cross-validation folds (default: 3)."
+    )
     args = parser.parse_args()
-    run_training(quick=args.quick)
+
+    # quick=True (fast grid) UNLESS --full is passed
+    run_training(quick=not args.full, cv_folds=args.cv)
