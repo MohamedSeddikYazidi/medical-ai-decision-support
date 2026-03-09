@@ -55,7 +55,7 @@ def _mlflow_local_uri(path: str) -> str:
     from pathlib import Path
     return Path(os.path.abspath(path)).as_uri()
 
-MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", _mlflow_local_uri(MLRUNS_DIR))
+MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", _mlflow_local_uri(MODEL_DIR))
 EXPERIMENT_NAME = "diabetes_readmission_v1"
 
 
