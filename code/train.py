@@ -51,11 +51,7 @@ RESULTS_PATH = os.path.join(MODEL_DIR, "training_results.json")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ── MLflow config ──────────────────────────────────────────────────────────────
-# Use proper file:// URI format for MLflow (convert backslashes to forward slashes)
-MLRUNS_DIR = os.path.join(BASE_DIR, "mlruns")
-os.makedirs(MLRUNS_DIR, exist_ok=True)
-mlruns_path = MLRUNS_DIR.replace("\\", "/")
-MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", f"file:///{mlruns_path}" if not mlruns_path.startswith("/") else f"file://{mlruns_path}")
+MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", f"file://{BASE_DIR}/mlruns")
 EXPERIMENT_NAME = "diabetes_readmission_v1"
 
 
@@ -180,6 +176,26 @@ def get_quick_param_grids() -> Dict[str, dict]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Dependency pre-check
+# ─────────────────────────────────────────────────────────────────────────────
+def _check_dependencies() -> None:
+    """Warn early about any missing optional packages so errors are clear."""
+    checks = {
+        "xgboost":  "pip install xgboost",
+        "imblearn": "pip install imbalanced-learn",
+        "mlflow":   "pip install mlflow",
+    }
+    for module, install_cmd in checks.items():
+        try:
+            __import__(module)
+        except ImportError:
+            logger.warning(
+                "Optional package '%s' not found — install with: %s",
+                module, install_cmd,
+            )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Main training orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 def run_training(quick: bool = False, random_state: int = 42) -> str:
@@ -190,6 +206,8 @@ def run_training(quick: bool = False, random_state: int = 42) -> str:
     -------
     str  : path to the saved best model
     """
+    _check_dependencies()
+
     # ── 1. Load data ──────────────────────────────────────────────────────────
     try:
         from data_loader import load_data
@@ -216,24 +234,52 @@ def run_training(quick: bool = False, random_state: int = 42) -> str:
 
     results: Dict[str, dict] = {}
     trained_models: Dict[str, object] = {}
+    failed_models: Dict[str, str] = {}
 
     for name, model in models.items():
-        grid = param_grids.get(name, {})
-        best_est, val_metrics, best_params = train_model(
-            model_name=name,
-            model=model,
-            param_grid=grid,
-            X_train=X_train,
-            y_train=y_train,
-            X_val=X_val,
-            y_val=y_val,
-            random_state=random_state,
+        logger.info("─" * 60)
+        logger.info("Starting model: %s", name)
+        try:
+            grid = param_grids.get(name, {})
+            best_est, val_metrics, best_params = train_model(
+                model_name=name,
+                model=model,
+                param_grid=grid,
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                random_state=random_state,
+            )
+            results[name] = {
+                "val_metrics": val_metrics,
+                "best_params": best_params,
+            }
+            trained_models[name] = best_est
+            logger.info("✓  %s  completed successfully", name)
+        except Exception as exc:
+            logger.error("✗  %s  FAILED: %s", name, exc, exc_info=True)
+            failed_models[name] = str(exc)
+            # Log the failure as its own MLflow run so it appears in the UI
+            try:
+                mlflow.set_tracking_uri(MLFLOW_URI)
+                mlflow.set_experiment(EXPERIMENT_NAME)
+                with mlflow.start_run(run_name=f"{name}_FAILED"):
+                    mlflow.set_tag("status", "FAILED")
+                    mlflow.set_tag("model_name", name)
+                    mlflow.set_tag("error", str(exc)[:500])
+            except Exception:
+                pass
+            continue  # <-- keeps the loop going for the remaining models
+
+    if not results:
+        raise RuntimeError(
+            "All models failed to train. Errors:\n"
+            + "\n".join(f"  {k}: {v}" for k, v in failed_models.items())
         )
-        results[name] = {
-            "val_metrics": val_metrics,
-            "best_params": best_params,
-        }
-        trained_models[name] = best_est
+
+    if failed_models:
+        logger.warning("The following models failed and were skipped: %s", list(failed_models.keys()))
 
     # ── 5. Select best model ──────────────────────────────────────────────────
     best_name = max(
