@@ -1,5 +1,5 @@
 artifact_uri: file:///C:/Users/SEDDIK/medical-ai-decision-support/models/213052563654303984/6f78e4545ccc4e3b97fc2860cb4056a5/artifacts
-end_time: null
+end_time: 1773098537007
 entry_point_name: ''
 experiment_id: '213052563654303984'
 lifecycle_stage: active
@@ -10,6 +10,6 @@ source_name: ''
 source_type: 4
 source_version: ''
 start_time: 1773083476835
-status: 1
+status: 4
 tags: []
 user_id: SEDDIK
