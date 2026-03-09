@@ -1,0 +1,174 @@
+"""
+data_loader.py
+==============
+Loads and performs initial cleaning of the Diabetes 130-US Hospitals dataset.
+Handles the binary target conversion: 1 = readmitted <30 days, 0 = otherwise.
+"""
+
+import pandas as pd
+import numpy as np
+import os
+import logging
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
+
+# ── Feature sets ──────────────────────────────────────────────────────────────
+FEATURES = [
+    "race", "gender", "age",
+    "time_in_hospital", "num_lab_procedures", "num_procedures",
+    "num_medications", "number_outpatient", "number_emergency",
+    "number_inpatient", "diag_1", "diag_2", "diag_3",
+    "insulin", "change", "diabetesMed",
+]
+
+CATEGORICAL_FEATURES = [
+    "race", "gender", "age", "diag_1", "diag_2", "diag_3",
+    "insulin", "change", "diabetesMed",
+]
+
+NUMERICAL_FEATURES = [
+    "time_in_hospital", "num_lab_procedures", "num_procedures",
+    "num_medications", "number_outpatient", "number_emergency",
+    "number_inpatient",
+]
+
+TARGET = "readmitted"
+
+# ── Dataset URL / local path ──────────────────────────────────────────────────
+DATA_URL = (
+    "https://archive.ics.uci.edu/ml/machine-learning-databases/"
+    "00296/dataset_diabetes.zip"
+)
+LOCAL_PATH = os.path.join(os.path.dirname(__file__), "..", "data", "diabetic_data.csv")
+
+
+def _convert_target(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert multi-class readmission to binary classification."""
+    df = df.copy()
+    df[TARGET] = (df[TARGET] == "<30").astype(int)
+    return df
+
+
+def _replace_missing_markers(df: pd.DataFrame) -> pd.DataFrame:
+    """Replace '?' markers with NaN."""
+    return df.replace("?", np.nan)
+
+
+def _drop_irrelevant_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop columns not used in modelling."""
+    drop_cols = [
+        "encounter_id", "patient_nbr", "weight", "payer_code",
+        "medical_specialty", "examide", "citoglipton",
+    ]
+    existing = [c for c in drop_cols if c in df.columns]
+    return df.drop(columns=existing)
+
+
+def load_data(path: str = LOCAL_PATH) -> pd.DataFrame:
+    """
+    Load and return the cleaned DataFrame.
+
+    Parameters
+    ----------
+    path : str
+        Path to the CSV file.
+
+    Returns
+    -------
+    pd.DataFrame
+        Cleaned dataset with binary target column.
+    """
+    if not os.path.exists(path):
+        _download_dataset(path)
+
+    logger.info("Loading dataset from %s", path)
+    df = pd.read_csv(path, low_memory=False)
+    logger.info("Raw shape: %s", df.shape)
+
+    df = _replace_missing_markers(df)
+    df = _drop_irrelevant_columns(df)
+    df = _convert_target(df)
+
+    # Keep only the features we care about + target
+    available = [c for c in FEATURES if c in df.columns]
+    df = df[available + [TARGET]]
+
+    # Remove duplicate patient encounters (keep first)
+    df = df.drop_duplicates()
+
+    logger.info("Cleaned shape: %s", df.shape)
+    logger.info("Target distribution:\n%s", df[TARGET].value_counts())
+    return df
+
+
+def _download_dataset(destination: str) -> None:
+    """Download the dataset from UCI repository."""
+    import zipfile
+    import urllib.request
+    import tempfile
+
+    os.makedirs(os.path.dirname(destination), exist_ok=True)
+    logger.info("Downloading dataset from UCI repository …")
+    with tempfile.TemporaryDirectory() as tmp:
+        zip_path = os.path.join(tmp, "dataset.zip")
+        urllib.request.urlretrieve(DATA_URL, zip_path)
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            zf.extractall(tmp)
+        # Find the CSV
+        for root, _, files in os.walk(tmp):
+            for f in files:
+                if f.endswith(".csv") and "diabetic" in f.lower():
+                    import shutil
+                    shutil.copy(os.path.join(root, f), destination)
+                    logger.info("Dataset saved to %s", destination)
+                    return
+    raise FileNotFoundError("Could not locate CSV inside downloaded archive.")
+
+
+def generate_synthetic_data(n_samples: int = 5000, random_state: int = 42) -> pd.DataFrame:
+    """
+    Generate a synthetic dataset that mirrors the real dataset's structure.
+    Used for unit tests and CI pipelines where the real data is unavailable.
+    """
+    rng = np.random.default_rng(random_state)
+
+    age_brackets = [
+        "[0-10)", "[10-20)", "[20-30)", "[30-40)", "[40-50)",
+        "[50-60)", "[60-70)", "[70-80)", "[80-90)", "[90-100)",
+    ]
+    diag_codes = ["250", "401", "428", "414", "276", "427", "496", "490", "403"]
+    insulin_vals = ["No", "Steady", "Up", "Down"]
+
+    df = pd.DataFrame({
+        "race": rng.choice(["Caucasian", "AfricanAmerican", "Hispanic", "Other", np.nan],
+                           n_samples, p=[0.75, 0.19, 0.02, 0.02, 0.02]),
+        "gender": rng.choice(["Male", "Female", "Unknown/Invalid"], n_samples,
+                             p=[0.46, 0.53, 0.01]),
+        "age": rng.choice(age_brackets, n_samples),
+        "time_in_hospital": rng.integers(1, 14, n_samples),
+        "num_lab_procedures": rng.integers(1, 120, n_samples),
+        "num_procedures": rng.integers(0, 7, n_samples),
+        "num_medications": rng.integers(1, 81, n_samples),
+        "number_outpatient": rng.integers(0, 42, n_samples),
+        "number_emergency": rng.integers(0, 76, n_samples),
+        "number_inpatient": rng.integers(0, 21, n_samples),
+        "diag_1": rng.choice(diag_codes, n_samples),
+        "diag_2": rng.choice(diag_codes + [np.nan], n_samples),
+        "diag_3": rng.choice(diag_codes + [np.nan], n_samples),
+        "insulin": rng.choice(insulin_vals, n_samples),
+        "change": rng.choice(["Ch", "No"], n_samples),
+        "diabetesMed": rng.choice(["Yes", "No"], n_samples),
+        TARGET: rng.choice([0, 1], n_samples, p=[0.89, 0.11]),
+    })
+    return df
+
+
+if __name__ == "__main__":
+    try:
+        df = load_data()
+    except Exception:
+        logger.warning("Real data unavailable — generating synthetic sample.")
+        df = generate_synthetic_data()
+    print(df.head())
+    print(df.dtypes)

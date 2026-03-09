@@ -1,0 +1,92 @@
+version: "3.9"
+
+# ── Clinical Decision Support System — Docker Compose ─────────────────────────
+#
+# Services:
+#   backend  – FastAPI prediction API   (port 8000)
+#   frontend – React dashboard          (port 3000)
+#   mlflow   – Experiment tracking UI   (port 5001)
+#
+# Usage:
+#   docker compose up --build           # first run
+#   docker compose up -d                # detached
+#   docker compose logs -f backend      # tail logs
+
+networks:
+  cdss_net:
+    driver: bridge
+
+volumes:
+  mlflow_data:
+  model_data:
+
+services:
+
+  # ── MLflow tracking server ──────────────────────────────────────────────────
+  mlflow:
+    image: ghcr.io/mlflow/mlflow:v2.11.1
+    container_name: cdss_mlflow
+    networks: [cdss_net]
+    ports:
+      - "5001:5000"
+    volumes:
+      - mlflow_data:/mlflow
+    command: >
+      mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri sqlite:///mlflow/mlflow.db
+        --default-artifact-root /mlflow/artifacts
+    # healthcheck:
+    #   test: ["CMD", "curl", "-f", "http://localhost:5000/" ]
+    #   interval: 30s
+    #   timeout: 10s
+    #   retries: 5
+    #   start_period: 20s
+    restart: unless-stopped
+
+  # ── FastAPI backend ─────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.backend
+    container_name: cdss_backend
+    networks: [cdss_net]
+    ports:
+      - "8000:8000"
+    volumes:
+      - model_data:/app/models
+      - ./data:/app/data:ro
+      - ./reports:/app/reports
+    environment:
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - PYTHONUNBUFFERED=1
+    depends_on:
+      - mlflow
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+
+  # ── React frontend ──────────────────────────────────────────────────────────
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.frontend
+      args:
+        - REACT_APP_API_URL=http://localhost:8000
+    container_name: cdss_frontend
+    networks: [cdss_net]
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped

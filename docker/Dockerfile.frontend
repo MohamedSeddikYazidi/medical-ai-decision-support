@@ -1,0 +1,33 @@
+# ── Frontend Dockerfile ───────────────────────────────────────────────────────
+# Multi-stage: build with Node, serve with Nginx.
+
+# ── Stage 1: Node build ───────────────────────────────────────────────────────
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Install dependencies first (better layer caching)
+COPY frontend/package.json frontend/package-lock.json* ./
+RUN npm install --ci
+
+# Copy source and build
+COPY frontend/ .
+ARG REACT_APP_API_URL=http://localhost:8000
+ENV REACT_APP_API_URL=${REACT_APP_API_URL}
+RUN npm run build
+
+# ── Stage 2: Nginx serve ──────────────────────────────────────────────────────
+FROM nginx:1.25-alpine AS runtime
+
+LABEL description="Clinical Decision Support — React Frontend"
+
+# Custom nginx config for React SPA
+COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+COPY --from=builder /app/build /usr/share/nginx/html
+
+EXPOSE 80
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 \
+    CMD wget -q --spider http://localhost/ || exit 1
+
+CMD ["nginx", "-g", "daemon off;"]

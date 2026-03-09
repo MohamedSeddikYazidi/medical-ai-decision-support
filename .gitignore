@@ -1,0 +1,49 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# ── Data (too large for git) ──────────────────────────────────────────────────
+data/
+*.csv
+*.zip
+
+# ── Model artefacts ───────────────────────────────────────────────────────────
+models/*.joblib
+models/*.pkl
+# Keep training_results.json for CI reference
+!models/training_results.json
+
+# ── MLflow ────────────────────────────────────────────────────────────────────
+mlruns/
+mlartifacts/
+
+# ── Reports ───────────────────────────────────────────────────────────────────
+reports/
+
+# ── Node / React ──────────────────────────────────────────────────────────────
+frontend/node_modules/
+frontend/build/
+.npm
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+
+# ── OS ────────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Env files ─────────────────────────────────────────────────────────────────
+.env
+.env.local
+.env.production
