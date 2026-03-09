@@ -51,7 +51,11 @@ RESULTS_PATH = os.path.join(MODEL_DIR, "training_results.json")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 # ── MLflow config ──────────────────────────────────────────────────────────────
-MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", f"file://{BASE_DIR}/mlruns")
+def _mlflow_local_uri(path: str) -> str:
+    from pathlib import Path
+    return Path(os.path.abspath(path)).as_uri()
+
+MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", _mlflow_local_uri(MLRUNS_DIR))
 EXPERIMENT_NAME = "diabetes_readmission_v1"
 
 
