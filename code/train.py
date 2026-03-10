@@ -56,7 +56,7 @@ MLRUNS_DIR.mkdir(exist_ok=True)
 BEST_MODEL_PATH = str(MODEL_DIR / "best_model.joblib")
 RESULTS_PATH    = str(MODEL_DIR / "training_results.json")
 
-# Windows-safe MLflow URI (file:///C:/... on Win, file:///home/... on Unix)
+
 MLFLOW_URI      = os.getenv("MLFLOW_TRACKING_URI", MLRUNS_DIR.as_uri())
 EXPERIMENT_NAME = "diabetes_readmission_v1"
 logger.info("MLflow URI: %s", MLFLOW_URI)
