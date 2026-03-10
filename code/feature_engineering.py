@@ -175,7 +175,7 @@ NEW_BINARY_FEATURES = [
 
 ALL_NUMERICAL_FEATURES = NUMERICAL_FEATURES + NEW_NUMERICAL_FEATURES + NEW_BINARY_FEATURES
 
-
+#
 if __name__ == "__main__":
     from data_loader import generate_synthetic_data
     df = generate_synthetic_data(n_samples=500)

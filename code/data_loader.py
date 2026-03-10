@@ -196,7 +196,7 @@ def generate_synthetic_data(n_samples: int = 5000, random_state: int = 42) -> pd
         TARGET: rng.choice([0, 1], n_samples, p=[0.89, 0.11]),
     })
     return df
-
+#test
 
 if __name__ == "__main__":
     try:
