@@ -1,9 +1,10 @@
 """
-app.py  (v2)
+app.py  (v3)
 ============
-New endpoints:
-  GET  /models/list          -> names of all available trained models + metrics
-  POST /predict?model=<name> -> predict using a specific model
+Updated PatientInput to include new clinically-relevant features:
+  A1Cresult, max_glu_serum, admission_type_id, discharge_disposition_id, num_diagnoses
+GET /models/list  →  all available trained models + metrics
+POST /predict?model=<n>  →  choose specific model
 """
 
 import json
@@ -29,14 +30,14 @@ from predict import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
-BASE_DIR    = Path(__file__).resolve().parent.parent
-MODEL_DIR   = BASE_DIR / "models"
+BASE_DIR     = Path(__file__).resolve().parent.parent
+MODEL_DIR    = BASE_DIR / "models"
 RESULTS_PATH = MODEL_DIR / "training_results.json"
 
 app = FastAPI(
     title="Clinical Decision Support API",
     description="AI readmission risk prediction — Diabetes 130-US Hospitals",
-    version="2.0.0",
+    version="3.0.0",
     docs_url="/docs",
 )
 
@@ -52,24 +53,37 @@ _startup_time = time.time()
 # Schemas
 # ─────────────────────────────────────────────────────────────────────────────
 class PatientInput(BaseModel):
-    race: Optional[str]   = Field(None, example="Caucasian")
+    # Demographics
+    race:   Optional[str] = Field(None, example="Caucasian")
     gender: Optional[str] = Field(None, example="Male")
-    age: str              = Field(...,  example="[70-80)")
+    age:    str            = Field(...,  example="[70-80)")
 
-    time_in_hospital:   int = Field(..., ge=1,  le=14,  example=5)
-    num_lab_procedures: int = Field(..., ge=0,  le=132, example=40)
-    num_procedures:     int = Field(..., ge=0,  le=6,   example=1)
-    num_medications:    int = Field(..., ge=0,  le=81,  example=12)
-    number_outpatient:  int = Field(..., ge=0,          example=0)
-    number_emergency:   int = Field(..., ge=0,          example=1)
-    number_inpatient:   int = Field(..., ge=0,          example=2)
+    # Encounter
+    time_in_hospital:   int = Field(..., ge=1, le=14, example=5)
+    num_lab_procedures: int = Field(..., ge=0, le=132, example=40)
+    num_procedures:     int = Field(..., ge=0, le=6,   example=1)
+    num_medications:    int = Field(..., ge=0, le=81,  example=12)
+    num_diagnoses:      int = Field(default=5, ge=1, le=16, example=5)
+    number_outpatient:  int = Field(..., ge=0, example=0)
+    number_emergency:   int = Field(..., ge=0, example=0)
+    number_inpatient:   int = Field(..., ge=0, example=0)
 
+    # Diagnoses
     diag_1: Optional[str] = Field(None, example="250")
     diag_2: Optional[str] = Field(None, example="401")
     diag_3: Optional[str] = Field(None, example="428")
 
-    insulin:     Optional[str] = Field(None, example="Up")
-    change:      Optional[str] = Field(None, example="Ch")
+    # Lab results (very important for diabetes outcomes)
+    A1Cresult:     Optional[str] = Field(default="None", example=">7")
+    max_glu_serum: Optional[str] = Field(default="None", example=">200")
+
+    # Admission / discharge context
+    admission_type_id:       int = Field(default=1, ge=1, le=8, example=1)
+    discharge_disposition_id: int = Field(default=1, ge=1, le=30, example=1)
+
+    # Medications
+    insulin:     Optional[str] = Field(None, example="Steady")
+    change:      Optional[str] = Field(None, example="No")
     diabetesMed: Optional[str] = Field(None, example="Yes")
 
     @field_validator("age")
@@ -91,24 +105,22 @@ class PredictionResponse(BaseModel):
 
 
 class ModelSummary(BaseModel):
-    model_name: str
+    model_name:  str
     val_roc_auc: float
-    val_f1: float
+    val_f1:      float
     test_roc_auc: float
-    is_best: bool
+    is_best:     bool
 
 
 class ModelsListResponse(BaseModel):
-    available: list[ModelSummary]
-    best_model: str
+    available:   list[ModelSummary]
+    best_model:  str
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Request logger
 # ─────────────────────────────────────────────────────────────────────────────
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
-    t = time.time()
+    t    = time.time()
     resp = await call_next(request)
     logger.info("%s %s → %d  (%.0fms)",
                 request.method, request.url.path, resp.status_code, (time.time()-t)*1000)
@@ -127,36 +139,34 @@ async def health():
     except Exception:
         pass
     return {
-        "status":          "healthy" if model_loaded else "degraded",
-        "uptime_seconds":  round(time.time() - _startup_time, 1),
-        "model_loaded":    model_loaded,
-        "model_name":      model_name,
-        "api_version":     "2.0.0",
+        "status":           "healthy" if model_loaded else "degraded",
+        "uptime_seconds":   round(time.time() - _startup_time, 1),
+        "model_loaded":     model_loaded,
+        "model_name":       model_name,
+        "api_version":      "3.0.0",
         "available_models": list_available_models(),
     }
 
 
 @app.get("/models/list", response_model=ModelsListResponse, tags=["Model"])
 async def models_list():
-    """Return all trained models with their metrics and which is best."""
-    available_names = list_available_models()
-    if not available_names:
-        raise HTTPException(status_code=503, detail="No trained models found. Run train.py first.")
+    available = list_available_models()
+    if not available:
+        raise HTTPException(status_code=503, detail="No models found. Run train.py first.")
 
-    best_model = "best_model"
+    best_model  = "best_model"
     all_results = {}
-
     if RESULTS_PATH.exists():
         with open(RESULTS_PATH) as f:
-            summary = json.load(f)
+            summary     = json.load(f)
         best_model  = summary.get("best_model", "best_model")
         all_results = summary.get("all_results", {})
 
     summaries = []
-    for name in available_names:
+    for name in available:
         if name == "best_model":
             continue
-        r = all_results.get(name, {})
+        r  = all_results.get(name, {})
         vm = r.get("val_metrics",  {})
         tm = r.get("test_metrics", {})
         summaries.append(ModelSummary(
@@ -166,8 +176,6 @@ async def models_list():
             test_roc_auc = round(tm.get("roc_auc", 0), 4),
             is_best      = (name == best_model),
         ))
-
-    # Sort best first
     summaries.sort(key=lambda s: (s.is_best, s.val_roc_auc), reverse=True)
     return ModelsListResponse(available=summaries, best_model=best_model)
 
@@ -177,20 +185,13 @@ async def predict(
     patient: PatientInput,
     model: Optional[str] = Query(
         default=None,
-        description="Model to use: logistic_regression | random_forest | xgboost. "
-                    "Omit for the best model."
+        description="logistic_regression | random_forest | xgboost | lightgbm. "
+                    "Omit for best model."
     ),
 ):
-    """Predict readmission risk. Pass ?model=<name> to choose a specific model."""
     try:
         result = predict_single(patient.model_dump(), model_name=model)
-        return PredictionResponse(
-            readmission_probability=result.readmission_probability,
-            risk_level=result.risk_level,
-            model_name=result.model_name,
-            confidence=result.confidence,
-            clinical_notes=result.clinical_notes,
-        )
+        return PredictionResponse(**vars(result))
     except FileNotFoundError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -207,8 +208,7 @@ async def predict_batch_endpoint(
         raise HTTPException(status_code=400, detail="Max batch size is 500.")
     try:
         df = pd.DataFrame([p.model_dump() for p in patients])
-        results = predict_batch(df, model_name=model)
-        return [PredictionResponse(**vars(r)) for r in results]
+        return [PredictionResponse(**vars(r)) for r in predict_batch(df, model_name=model)]
     except FileNotFoundError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
@@ -226,7 +226,7 @@ async def get_metrics():
 
 @app.get("/", tags=["System"])
 async def root():
-    return {"message": "Clinical Decision Support API v2", "docs": "/docs"}
+    return {"message": "Clinical Decision Support API v3", "docs": "/docs"}
 
 
 if __name__ == "__main__":

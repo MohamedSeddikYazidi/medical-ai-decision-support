@@ -15,22 +15,34 @@ logger = logging.getLogger(__name__)
 
 # ── Feature sets ──────────────────────────────────────────────────────────────
 FEATURES = [
+    # demographics
     "race", "gender", "age",
+    # encounter
     "time_in_hospital", "num_lab_procedures", "num_procedures",
     "num_medications", "number_outpatient", "number_emergency",
-    "number_inpatient", "diag_1", "diag_2", "diag_3",
+    "number_inpatient", "num_diagnoses",
+    # diagnoses
+    "diag_1", "diag_2", "diag_3",
+    # lab results  (very clinically important for diabetes)
+    "A1Cresult", "max_glu_serum",
+    # admission/discharge context
+    "admission_type_id", "discharge_disposition_id",
+    # medications
     "insulin", "change", "diabetesMed",
 ]
 
 CATEGORICAL_FEATURES = [
-    "race", "gender", "age", "diag_1", "diag_2", "diag_3",
+    "race", "gender", "age",
+    "diag_1", "diag_2", "diag_3",
+    "A1Cresult", "max_glu_serum",
     "insulin", "change", "diabetesMed",
 ]
 
 NUMERICAL_FEATURES = [
     "time_in_hospital", "num_lab_procedures", "num_procedures",
     "num_medications", "number_outpatient", "number_emergency",
-    "number_inpatient",
+    "number_inpatient", "num_diagnoses",
+    "admission_type_id", "discharge_disposition_id",
 ]
 
 TARGET = "readmitted"
@@ -60,6 +72,7 @@ def _drop_irrelevant_columns(df: pd.DataFrame) -> pd.DataFrame:
     drop_cols = [
         "encounter_id", "patient_nbr", "weight", "payer_code",
         "medical_specialty", "examide", "citoglipton",
+        "admission_source_id",  # less predictive than admission_type
     ]
     existing = [c for c in drop_cols if c in df.columns]
     return df.drop(columns=existing)
@@ -95,6 +108,8 @@ def load_data(path: str = LOCAL_PATH) -> pd.DataFrame:
     df = df[available + [TARGET]]
 
     # Remove duplicate patient encounters (keep first)
+    if "patient_nbr" not in df.columns:
+        pass  # already dropped
     df = df.drop_duplicates()
 
     logger.info("Cleaned shape: %s", df.shape)
