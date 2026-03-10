@@ -1,18 +1,19 @@
 """
-train.py
-========
-Full training pipeline:
-  1. Load & engineer features
-  2. Preprocess (encode, scale, SMOTE)
-  3. For each model:
-     a. GridSearchCV hyperparameter tuning
-     b. MLflow experiment logging (params, metrics, artifacts)
-  4. Select best model by ROC-AUC
-  5. Persist best model + preprocessor
+train.py  (v3)
+==============
+Changes vs v2:
+  - Saves ALL three models individually (not just best) so the API can
+    serve any of them on request
+  - Fixes MLflow URI for Windows using pathlib.Path.as_uri()
+  - Engineered features now flow through correctly via preprocessing v3
+  - Default mode is fast (3 folds, compact grid); use --full for thorough run
+  - Added --cv flag to control fold count
 
 Usage
 -----
-  python train.py [--quick]    # --quick uses a small grid for CI speed
+  python train.py              # fast default (~5-15 min)
+  python train.py --full       # full grid search (~30-60 min)
+  python train.py --cv 5       # custom fold count
 """
 
 import argparse
@@ -20,6 +21,7 @@ import json
 import logging
 import os
 import warnings
+from pathlib import Path
 from typing import Dict, Tuple
 
 import joblib
@@ -44,100 +46,89 @@ from preprocessing import PreprocessingPipeline, PREPROCESSOR_PATH
 from modeling import get_models, get_param_grids, model_metadata
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-MODEL_DIR = os.path.join(BASE_DIR, "models")
-BEST_MODEL_PATH = os.path.join(MODEL_DIR, "best_model.joblib")
-RESULTS_PATH = os.path.join(MODEL_DIR, "training_results.json")
-os.makedirs(MODEL_DIR, exist_ok=True)
+BASE_DIR    = Path(__file__).resolve().parent.parent
+MODEL_DIR   = BASE_DIR / "models"
+MLRUNS_DIR  = BASE_DIR / "mlruns"
+MODEL_DIR.mkdir(exist_ok=True)
+MLRUNS_DIR.mkdir(exist_ok=True)
 
-# ── MLflow config ──────────────────────────────────────────────────────────────
-def _mlflow_local_uri(path: str) -> str:
-    """
-    Build a file:// URI that works on both Windows and Unix.
-    pathlib.Path.as_uri() produces the correct format on every OS:
-      Windows ->  file:///C:/Users/foo/mlruns
-      Unix    ->  file:///home/foo/mlruns
-    """
-    from pathlib import Path
-    return Path(os.path.abspath(path)).as_uri()
+BEST_MODEL_PATH = str(MODEL_DIR / "best_model.joblib")
+RESULTS_PATH    = str(MODEL_DIR / "training_results.json")
 
-MLRUNS_DIR = os.path.join(BASE_DIR, "mlruns")
-os.makedirs(MLRUNS_DIR, exist_ok=True)
-MLFLOW_URI = os.getenv("MLFLOW_TRACKING_URI", _mlflow_local_uri(MLRUNS_DIR))
+# ── MLflow — pathlib.as_uri() handles Windows/Mac/Linux correctly ─────────────
+MLFLOW_URI      = os.getenv("MLFLOW_TRACKING_URI", MLRUNS_DIR.as_uri())
 EXPERIMENT_NAME = "diabetes_readmission_v1"
+logger.info("MLflow tracking URI: %s", MLFLOW_URI)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Metrics helper
-# ─────────────────────────────────────────────────────────────────────────────
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray, y_prob: np.ndarray) -> Dict[str, float]:
+def _check_dependencies() -> None:
+    checks = {"xgboost": "pip install xgboost", "imblearn": "pip install imbalanced-learn"}
+    for mod, cmd in checks.items():
+        try:
+            __import__(mod)
+        except ImportError:
+            logger.warning("Package '%s' missing — install with: %s", mod, cmd)
+
+
+def compute_metrics(y_true, y_pred, y_prob) -> Dict[str, float]:
     return {
-        "roc_auc": roc_auc_score(y_true, y_prob),
-        "f1": f1_score(y_true, y_pred, zero_division=0),
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "accuracy": accuracy_score(y_true, y_pred),
+        "roc_auc":       roc_auc_score(y_true, y_prob),
+        "f1":            f1_score(y_true, y_pred, zero_division=0),
+        "precision":     precision_score(y_true, y_pred, zero_division=0),
+        "recall":        recall_score(y_true, y_pred, zero_division=0),
+        "accuracy":      accuracy_score(y_true, y_pred),
         "avg_precision": average_precision_score(y_true, y_prob),
     }
+
+
+def _grid_size(grid: dict) -> int:
+    n = 1
+    for v in grid.values():
+        n *= len(v)
+    return n
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Single model training run
 # ─────────────────────────────────────────────────────────────────────────────
 def train_model(
-    model_name: str,
-    model,
-    param_grid: dict,
-    X_train: np.ndarray,
-    y_train: np.ndarray,
-    X_val: np.ndarray,
-    y_val: np.ndarray,
-    cv_folds: int = 3,  # 3 folds = 40% faster than 5; increase with --full
-    random_state: int = 42,
+    model_name: str, model, param_grid: dict,
+    X_train, y_train, X_val, y_val,
+    cv_folds: int = 3, random_state: int = 42,
 ) -> Tuple[object, Dict[str, float], Dict]:
-    """
-    Run GridSearchCV, log to MLflow, return (best_estimator, val_metrics, best_params).
-    """
+
     mlflow.set_tracking_uri(MLFLOW_URI)
     mlflow.set_experiment(EXPERIMENT_NAME)
 
     with mlflow.start_run(run_name=model_name):
-        # ── tag metadata ──────────────────────────────────────────────────────
         mlflow.set_tags({
             "model_name": model_name,
             "dataset": "diabetes_130_hospitals",
             **model_metadata(model_name),
         })
 
-        # ── GridSearchCV ──────────────────────────────────────────────────────
-        logger.info("Tuning %s  (grid: %s combos) …", model_name,
-                    _grid_size(param_grid))
+        logger.info("Tuning %s  (%d combos × %d folds) …",
+                    model_name, _grid_size(param_grid), cv_folds)
 
         cv = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=random_state)
         gs = GridSearchCV(
-            estimator=model,
-            param_grid=param_grid,
-            cv=cv,
-            scoring="roc_auc",
-            n_jobs=-1,
-            verbose=0,
-            refit=True,
-            return_train_score=True,
+            estimator=model, param_grid=param_grid, cv=cv,
+            scoring="roc_auc", n_jobs=-1, verbose=0,
+            refit=True, return_train_score=True,
         )
         gs.fit(X_train, y_train)
-        best_est = gs.best_estimator_
+        best_est   = gs.best_estimator_
         best_params = gs.best_params_
 
-        logger.info("%s best params: %s", model_name, best_params)
-        logger.info("%s CV ROC-AUC:   %.4f", model_name, gs.best_score_)
+        logger.info("%s best params : %s", model_name, best_params)
+        logger.info("%s CV ROC-AUC  : %.4f", model_name, gs.best_score_)
 
-        # ── log params ────────────────────────────────────────────────────────
         mlflow.log_params(best_params)
         mlflow.log_param("cv_folds", cv_folds)
         mlflow.log_param("model_name", model_name)
         mlflow.log_metric("cv_roc_auc", gs.best_score_)
 
-        # ── validation metrics ────────────────────────────────────────────────
         y_pred = best_est.predict(X_val)
         y_prob = best_est.predict_proba(X_val)[:, 1]
         val_metrics = compute_metrics(y_val, y_pred, y_prob)
@@ -145,90 +136,43 @@ def train_model(
         for k, v in val_metrics.items():
             mlflow.log_metric(f"val_{k}", v)
 
-        logger.info(
-            "%s val metrics: AUC=%.4f | F1=%.4f | Prec=%.4f | Rec=%.4f",
-            model_name,
-            val_metrics["roc_auc"],
-            val_metrics["f1"],
-            val_metrics["precision"],
-            val_metrics["recall"],
-        )
+        logger.info("%s val: AUC=%.4f | F1=%.4f | Prec=%.4f | Rec=%.4f",
+                    model_name, val_metrics["roc_auc"], val_metrics["f1"],
+                    val_metrics["precision"], val_metrics["recall"])
 
-        # ── log model ─────────────────────────────────────────────────────────
         if model_name == "xgboost":
             mlflow.xgboost.log_model(best_est, artifact_path="model")
         else:
             mlflow.sklearn.log_model(best_est, artifact_path="model")
 
-        # ── log CV results as JSON artifact ───────────────────────────────────
-        cv_results = pd.DataFrame(gs.cv_results_)
-        cv_path = os.path.join(MODEL_DIR, f"{model_name}_cv_results.csv")
-        cv_results.to_csv(cv_path, index=False)
+        cv_path = str(MODEL_DIR / f"{model_name}_cv_results.csv")
+        pd.DataFrame(gs.cv_results_).to_csv(cv_path, index=False)
         mlflow.log_artifact(cv_path)
 
     return best_est, val_metrics, best_params
 
 
-def _grid_size(param_grid: dict) -> int:
-    n = 1
-    for v in param_grid.values():
-        n *= len(v)
-    return n
-
-
 # ─────────────────────────────────────────────────────────────────────────────
-# Quick grid (for CI / demo)
+# Parameter grids
 # ─────────────────────────────────────────────────────────────────────────────
 def get_quick_param_grids() -> Dict[str, dict]:
-    """
-    Fast grid designed to finish in ~5-10 min on 100k rows.
-    Each model has exactly 1-4 combinations x 3 CV folds = very fast.
-    Use python train.py          for this fast mode (default).
-    Use python train.py --full   for the complete search grid.
-    """
+    """Fast grids — full run in ~5-15 min on 100k rows."""
     return {
         "logistic_regression": {"C": [0.1, 1.0], "penalty": ["l2"]},
         "random_forest":       {"n_estimators": [100], "max_depth": [8],
-                                "max_features": ["sqrt"], "n_jobs": [-1]},
+                                "max_features": ["sqrt"]},
         "xgboost":             {"n_estimators": [100], "max_depth": [4],
                                 "learning_rate": [0.1], "scale_pos_weight": [8]},
     }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Dependency pre-check
-# ─────────────────────────────────────────────────────────────────────────────
-def _check_dependencies() -> None:
-    """Warn early about any missing optional packages so errors are clear."""
-    checks = {
-        "xgboost":  "pip install xgboost",
-        "imblearn": "pip install imbalanced-learn",
-        "mlflow":   "pip install mlflow",
-    }
-    for module, install_cmd in checks.items():
-        try:
-            __import__(module)
-        except ImportError:
-            logger.warning(
-                "Optional package '%s' not found — install with: %s",
-                module, install_cmd,
-            )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Main training orchestrator
+# Main orchestrator
 # ─────────────────────────────────────────────────────────────────────────────
 def run_training(quick: bool = True, random_state: int = 42, cv_folds: int = 3) -> str:
-    """
-    Full end-to-end training run.
-
-    Returns
-    -------
-    str  : path to the saved best model
-    """
     _check_dependencies()
 
-    # ── 1. Load data ──────────────────────────────────────────────────────────
+    # 1. Load data
     try:
         from data_loader import load_data
         df = load_data(LOCAL_PATH)
@@ -236,25 +180,23 @@ def run_training(quick: bool = True, random_state: int = 42, cv_folds: int = 3) 
         logger.warning("Real dataset not found — using synthetic data.")
         df = generate_synthetic_data(n_samples=8000, random_state=random_state)
 
-    # ── 2. Feature engineering ────────────────────────────────────────────────
+    # 2. Feature engineering
     df = engineer_features(df)
 
-    # ── 3. Preprocessing ──────────────────────────────────────────────────────
+    # 3. Preprocessing
     prep = PreprocessingPipeline(random_state=random_state)
     X_train, X_val, X_test, y_train, y_val, y_test = prep.fit_transform(df)
     prep.save()
 
-    logger.info("Training set  : %s  (after SMOTE)", X_train.shape)
-    logger.info("Validation set: %s", X_val.shape)
-    logger.info("Test set      : %s", X_test.shape)
+    logger.info("Train: %s | Val: %s | Test: %s", X_train.shape, X_val.shape, X_test.shape)
 
-    # ── 4. Train models ───────────────────────────────────────────────────────
-    models = get_models(random_state=random_state)
+    # 4. Train all models
+    models      = get_models(random_state=random_state)
     param_grids = get_quick_param_grids() if quick else get_param_grids()
 
-    results: Dict[str, dict] = {}
+    results: Dict[str, dict]   = {}
     trained_models: Dict[str, object] = {}
-    failed_models: Dict[str, str] = {}
+    failed_models: Dict[str, str]     = {}
 
     for name, model in models.items():
         logger.info("─" * 60)
@@ -262,120 +204,98 @@ def run_training(quick: bool = True, random_state: int = 42, cv_folds: int = 3) 
         try:
             grid = param_grids.get(name, {})
             best_est, val_metrics, best_params = train_model(
-                model_name=name,
-                model=model,
-                param_grid=grid,
-                X_train=X_train,
-                y_train=y_train,
-                X_val=X_val,
-                y_val=y_val,
-                cv_folds=cv_folds,
-                random_state=random_state,
+                model_name=name, model=model, param_grid=grid,
+                X_train=X_train, y_train=y_train,
+                X_val=X_val,   y_val=y_val,
+                cv_folds=cv_folds, random_state=random_state,
             )
-            results[name] = {
-                "val_metrics": val_metrics,
-                "best_params": best_params,
-            }
+            results[name]        = {"val_metrics": val_metrics, "best_params": best_params}
             trained_models[name] = best_est
-            logger.info("✓  %s  completed successfully", name)
+            logger.info("✓  %s  done", name)
         except Exception as exc:
             logger.error("✗  %s  FAILED: %s", name, exc, exc_info=True)
             failed_models[name] = str(exc)
-            # Log the failure as its own MLflow run so it appears in the UI
-            try:
-                mlflow.set_tracking_uri(MLFLOW_URI)
-                mlflow.set_experiment(EXPERIMENT_NAME)
-                with mlflow.start_run(run_name=f"{name}_FAILED"):
-                    mlflow.set_tag("status", "FAILED")
-                    mlflow.set_tag("model_name", name)
-                    mlflow.set_tag("error", str(exc)[:500])
-            except Exception:
-                pass
-            continue  # <-- keeps the loop going for the remaining models
+            continue
 
     if not results:
-        raise RuntimeError(
-            "All models failed to train. Errors:\n"
-            + "\n".join(f"  {k}: {v}" for k, v in failed_models.items())
-        )
-
+        raise RuntimeError("All models failed:\n" +
+                           "\n".join(f"  {k}: {v}" for k, v in failed_models.items()))
     if failed_models:
-        logger.warning("The following models failed and were skipped: %s", list(failed_models.keys()))
+        logger.warning("Skipped (failed): %s", list(failed_models.keys()))
 
-    # ── 5. Select best model ──────────────────────────────────────────────────
-    best_name = max(
-        results,
-        key=lambda n: results[n]["val_metrics"]["roc_auc"]
-        + results[n]["val_metrics"]["f1"],
-    )
-    best_model = trained_models[best_name]
+    # 5. Evaluate all models on test set
+    test_metrics_all: Dict[str, dict] = {}
+    for name, model in trained_models.items():
+        y_pred = model.predict(X_test)
+        y_prob = model.predict_proba(X_test)[:, 1]
+        test_metrics_all[name] = compute_metrics(y_test, y_pred, y_prob)
 
+    # 6. Select best model (ROC-AUC + F1)
+    best_name = max(results, key=lambda n:
+                    results[n]["val_metrics"]["roc_auc"] + results[n]["val_metrics"]["f1"])
+
+    # 7. Leaderboard
     logger.info("=" * 60)
-    logger.info("LEADERBOARD (sorted by ROC-AUC + F1)")
+    logger.info("LEADERBOARD  (val ROC-AUC + F1 combined)")
     for name in sorted(results, key=lambda n: results[n]["val_metrics"]["roc_auc"], reverse=True):
         m = results[name]["val_metrics"]
-        marker = " ← BEST" if name == best_name else ""
-        logger.info(
-            "  %-22s  AUC=%.4f  F1=%.4f  Prec=%.4f  Rec=%.4f%s",
-            name, m["roc_auc"], m["f1"], m["precision"], m["recall"], marker,
-        )
+        t = test_metrics_all.get(name, {})
+        marker = "  ← BEST" if name == best_name else ""
+        logger.info("  %-22s  val AUC=%.4f  F1=%.4f  |  test AUC=%.4f%s",
+                    name, m["roc_auc"], m["f1"], t.get("roc_auc", 0), marker)
     logger.info("=" * 60)
 
-    # ── 6. Final evaluation on held-out test set ──────────────────────────────
-    y_pred_test = best_model.predict(X_test)
-    y_prob_test = best_model.predict_proba(X_test)[:, 1]
-    test_metrics = compute_metrics(y_test, y_pred_test, y_prob_test)
+    # 8. Save EVERY trained model individually  ← new in v3
+    for name, model in trained_models.items():
+        individual_path = str(MODEL_DIR / f"{name}.joblib")
+        joblib.dump({
+            "model":        model,
+            "model_name":   name,
+            "val_metrics":  results[name]["val_metrics"],
+            "test_metrics": test_metrics_all.get(name, {}),
+            "best_params":  results[name]["best_params"],
+            "feature_names": prep.feature_names_out_,
+        }, individual_path)
+        logger.info("Saved %s → %s", name, individual_path)
 
-    logger.info("FINAL TEST METRICS (%s):", best_name)
-    for k, v in test_metrics.items():
-        logger.info("  %-20s: %.4f", k, v)
-
-    # ── 7. Save best model ────────────────────────────────────────────────────
-    payload = {
-        "model": best_model,
-        "model_name": best_name,
-        "val_metrics": results[best_name]["val_metrics"],
-        "test_metrics": test_metrics,
-        "best_params": results[best_name]["best_params"],
+    # 9. Save best model as default
+    best_payload = {
+        "model":        trained_models[best_name],
+        "model_name":   best_name,
+        "val_metrics":  results[best_name]["val_metrics"],
+        "test_metrics": test_metrics_all[best_name],
+        "best_params":  results[best_name]["best_params"],
         "feature_names": prep.feature_names_out_,
     }
-    joblib.dump(payload, BEST_MODEL_PATH)
-    logger.info("Best model saved to %s", BEST_MODEL_PATH)
+    joblib.dump(best_payload, BEST_MODEL_PATH)
+    logger.info("Best model → %s", BEST_MODEL_PATH)
 
-    # ── 8. Persist summary ────────────────────────────────────────────────────
+    # 10. Save JSON summary
     summary = {
-        "best_model": best_name,
-        "val_metrics": results[best_name]["val_metrics"],
-        "test_metrics": test_metrics,
+        "best_model":    best_name,
+        "available_models": list(trained_models.keys()),
+        "val_metrics":   results[best_name]["val_metrics"],
+        "test_metrics":  test_metrics_all[best_name],
         "all_results": {
-            n: {
-                "val_metrics": v["val_metrics"],
-                "best_params": v["best_params"],
-            }
+            n: {"val_metrics": v["val_metrics"],
+                "test_metrics": test_metrics_all.get(n, {}),
+                "best_params":  v["best_params"]}
             for n, v in results.items()
         },
     }
     with open(RESULTS_PATH, "w") as f:
         json.dump(summary, f, indent=2)
+    logger.info("Summary → %s", RESULTS_PATH)
 
-    logger.info("Training summary saved to %s", RESULTS_PATH)
     return BEST_MODEL_PATH
 
 
 # ─────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Train diabetes readmission models."
-    )
-    parser.add_argument(
-        "--full", action="store_true",
-        help="Run the complete hyperparameter grid (slow, use after quick run works)."
-    )
-    parser.add_argument(
-        "--cv", type=int, default=3,
-        help="Number of cross-validation folds (default: 3)."
-    )
+    parser = argparse.ArgumentParser(description="Train diabetes readmission models.")
+    parser.add_argument("--full", action="store_true",
+                        help="Full hyperparameter grid (slower, more thorough).")
+    parser.add_argument("--cv", type=int, default=3,
+                        help="Number of cross-validation folds (default: 3).")
     args = parser.parse_args()
-
-    # quick=True (fast grid) UNLESS --full is passed
     run_training(quick=not args.full, cv_folds=args.cv)

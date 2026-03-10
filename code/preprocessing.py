@@ -1,13 +1,11 @@
 """
-preprocessing.py  (v2 — Windows-compatible, feature-count controlled)
+preprocessing.py  (v3 — includes engineered features, model-agnostic)
 ======================================================================
-Key changes vs v1
------------------
-* DiagnosisGrouper: maps raw ICD-9 codes -> 18 clinical chapter labels
-  BEFORE one-hot encoding, reducing diagnosis columns from ~2100 -> ~54
-* Total encoded features: ~80 (down from 2169) -> training is 10-50x faster
-* Windows-safe: no file:// URI issues; all paths use pathlib
-* SMOTE replaced with RandomOverSampler (faster on high-dim data)
+Fix vs v2: imports ALL_NUMERICAL_FEATURES from feature_engineering so that
+age_mid, total_visits, visit_intensity, procedure_ratio, medication_load,
+is_diabetic_diag, is_circulatory, is_respiratory, high_emergency,
+insulin_changed, polypharmacy, inpatient_recurrent are all passed to the
+model — these were silently dropped before, causing static predictions.
 """
 
 import os
@@ -38,52 +36,41 @@ PREPROCESSOR_PATH = os.path.join(MODEL_DIR, "preprocessor.joblib")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ICD-9 Chapter mapper  ← THE KEY FIX
-# Maps the 700+ raw diagnosis codes to 18 meaningful chapter groups.
-# 3 diag cols × 18 chapters = ~54 OHE columns instead of ~2100.
+# ICD-9 Chapter mapper
 # ─────────────────────────────────────────────────────────────────────────────
 def map_icd9_to_chapter(code) -> str:
-    """Convert a raw ICD-9 code string to its chapter group name."""
     if pd.isna(code):
         return "Unknown"
     code = str(code).strip()
-
-    # E/V codes
     if code.startswith("E"):
         return "External"
     if code.startswith("V"):
         return "Supplementary"
-
     try:
         num = float(code.split(".")[0])
     except ValueError:
         return "Other"
-
-    if   num < 140:   return "Infectious"
-    elif num < 240:   return "Neoplasms"
-    elif num < 280:   return "Endocrine"        # includes diabetes (250.xx)
-    elif num < 290:   return "Blood"
-    elif num < 320:   return "Mental"
-    elif num < 390:   return "Nervous"
-    elif num < 460:   return "Circulatory"
-    elif num < 520:   return "Respiratory"
-    elif num < 580:   return "Digestive"
-    elif num < 630:   return "Genitourinary"
-    elif num < 680:   return "Pregnancy"
-    elif num < 710:   return "Skin"
-    elif num < 740:   return "Musculoskeletal"
-    elif num < 760:   return "Congenital"
-    elif num < 780:   return "Perinatal"
-    elif num < 800:   return "Symptoms"
-    elif num < 1000:  return "Injury"
-    else:             return "Other"
+    if   num < 140:  return "Infectious"
+    elif num < 240:  return "Neoplasms"
+    elif num < 280:  return "Endocrine"
+    elif num < 290:  return "Blood"
+    elif num < 320:  return "Mental"
+    elif num < 390:  return "Nervous"
+    elif num < 460:  return "Circulatory"
+    elif num < 520:  return "Respiratory"
+    elif num < 580:  return "Digestive"
+    elif num < 630:  return "Genitourinary"
+    elif num < 680:  return "Pregnancy"
+    elif num < 710:  return "Skin"
+    elif num < 740:  return "Musculoskeletal"
+    elif num < 760:  return "Congenital"
+    elif num < 780:  return "Perinatal"
+    elif num < 800:  return "Symptoms"
+    elif num < 1000: return "Injury"
+    else:            return "Other"
 
 
 class DiagnosisGrouper(BaseEstimator, TransformerMixin):
-    """
-    sklearn transformer that maps ICD-9 code columns to chapter strings.
-    Applied to diag_1, diag_2, diag_3 before the ColumnTransformer.
-    """
     def __init__(self, diag_cols=("diag_1", "diag_2", "diag_3")):
         self.diag_cols = diag_cols
 
@@ -101,22 +88,17 @@ class DiagnosisGrouper(BaseEstimator, TransformerMixin):
 # ─────────────────────────────────────────────────────────────────────────────
 # ColumnTransformer
 # ─────────────────────────────────────────────────────────────────────────────
-def build_column_transformer(
-    cat_features: List[str],
-    num_features: List[str],
-) -> ColumnTransformer:
-    categorical_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="most_frequent")),
-        ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-    ])
-    numerical_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
-        ("scaler", StandardScaler()),
-    ])
+def build_column_transformer(cat_features: List[str], num_features: List[str]) -> ColumnTransformer:
     return ColumnTransformer(
         transformers=[
-            ("cat", categorical_pipeline, cat_features),
-            ("num", numerical_pipeline, num_features),
+            ("cat", Pipeline([
+                ("imputer", SimpleImputer(strategy="most_frequent")),
+                ("encoder", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
+            ]), cat_features),
+            ("num", Pipeline([
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+            ]), num_features),
         ],
         remainder="drop",
         verbose_feature_names_out=False,
@@ -124,16 +106,10 @@ def build_column_transformer(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Main pipeline class
+# Main pipeline
 # ─────────────────────────────────────────────────────────────────────────────
 class PreprocessingPipeline:
-    def __init__(
-        self,
-        test_size: float = 0.15,
-        val_size: float = 0.15,
-        smote_ratio: float = 0.3,
-        random_state: int = 42,
-    ):
+    def __init__(self, test_size=0.15, val_size=0.15, smote_ratio=0.3, random_state=42):
         self.test_size = test_size
         self.val_size = val_size
         self.smote_ratio = smote_ratio
@@ -146,10 +122,18 @@ class PreprocessingPipeline:
         self._fitted = False
 
     def _detect_feature_lists(self, df: pd.DataFrame) -> None:
+        # ── KEY FIX: include engineered features in numerical list ────────────
+        try:
+            from feature_engineering import ALL_NUMERICAL_FEATURES
+            num_candidates = ALL_NUMERICAL_FEATURES
+        except ImportError:
+            num_candidates = NUMERICAL_FEATURES
+
         self.cat_features_ = [c for c in CATEGORICAL_FEATURES if c in df.columns]
-        self.num_features_ = [c for c in NUMERICAL_FEATURES if c in df.columns]
-        logger.info("Categorical features: %s", self.cat_features_)
-        logger.info("Numerical features:   %s", self.num_features_)
+        self.num_features_ = [c for c in num_candidates if c in df.columns]
+
+        logger.info("Categorical features (%d): %s", len(self.cat_features_), self.cat_features_)
+        logger.info("Numerical features   (%d): %s", len(self.num_features_), self.num_features_)
 
     def fit_transform(self, df: pd.DataFrame) -> Tuple:
         self._detect_feature_lists(df)
@@ -157,26 +141,21 @@ class PreprocessingPipeline:
         X = df[all_features].copy()
         y = df[TARGET]
 
-        # Apply ICD-9 grouping BEFORE splitting (fit is identity, safe to do here)
         X = self.grouper.transform(X)
 
         # ── Split ──────────────────────────────────────────────────────────────
         X_temp, X_test, y_temp, y_test = train_test_split(
-            X, y, test_size=self.test_size,
-            random_state=self.random_state, stratify=y,
+            X, y, test_size=self.test_size, random_state=self.random_state, stratify=y,
         )
-        val_adj = self.val_size / (1 - self.test_size)
         X_train, X_val, y_train, y_val = train_test_split(
-            X_temp, y_temp, test_size=val_adj,
+            X_temp, y_temp,
+            test_size=self.val_size / (1 - self.test_size),
             random_state=self.random_state, stratify=y_temp,
         )
-        logger.info("Split: train=%d | val=%d | test=%d",
-                    len(X_train), len(X_val), len(X_test))
+        logger.info("Split: train=%d | val=%d | test=%d", len(X_train), len(X_val), len(X_test))
 
         # ── Encode + scale ─────────────────────────────────────────────────────
-        self.transformer = build_column_transformer(
-            self.cat_features_, self.num_features_
-        )
+        self.transformer = build_column_transformer(self.cat_features_, self.num_features_)
         X_train_enc = self.transformer.fit_transform(X_train)
         X_val_enc   = self.transformer.transform(X_val)
         X_test_enc  = self.transformer.transform(X_test)
@@ -186,26 +165,24 @@ class PreprocessingPipeline:
         except Exception:
             self.feature_names_out_ = [f"f{i}" for i in range(X_train_enc.shape[1])]
 
-        logger.info("Encoded feature count: %d  (was 2169 before fix)", X_train_enc.shape[1])
+        logger.info("Encoded feature count: %d  (numerical only: %d, categorical encoded: %d)",
+                    X_train_enc.shape[1],
+                    len(self.num_features_),
+                    X_train_enc.shape[1] - len(self.num_features_))
 
         # ── Class balancing ────────────────────────────────────────────────────
-        logger.info("Class distribution before resampling: %s",
+        logger.info("Class dist before resampling: %s",
                     dict(zip(*np.unique(y_train, return_counts=True))))
-
-        # Use RandomOverSampler — much faster than SMOTE on large arrays
         try:
             from imblearn.over_sampling import RandomOverSampler
-            ros = RandomOverSampler(
-                sampling_strategy=self.smote_ratio,
-                random_state=self.random_state,
-            )
+            ros = RandomOverSampler(sampling_strategy=self.smote_ratio, random_state=self.random_state)
             X_train_res, y_train_res = ros.fit_resample(X_train_enc, y_train)
             logger.info("RandomOverSampler applied.")
         except ImportError:
-            logger.warning("imbalanced-learn not found — using raw training data.")
+            logger.warning("imbalanced-learn not found — skipping resampling.")
             X_train_res, y_train_res = X_train_enc, y_train.values
 
-        logger.info("Class distribution after resampling:  %s",
+        logger.info("Class dist after  resampling: %s",
                     dict(zip(*np.unique(y_train_res, return_counts=True))))
 
         self._fitted = True
@@ -231,7 +208,7 @@ class PreprocessingPipeline:
             "num_features":      self.num_features_,
             "feature_names_out": self.feature_names_out_,
         }, path)
-        logger.info("Preprocessor saved to %s", path)
+        logger.info("Preprocessor saved → %s", path)
 
     @classmethod
     def load(cls, path: str = PREPROCESSOR_PATH) -> "PreprocessingPipeline":
@@ -243,14 +220,5 @@ class PreprocessingPipeline:
         inst.num_features_      = payload["num_features"]
         inst.feature_names_out_ = payload["feature_names_out"]
         inst._fitted = True
-        logger.info("Preprocessor loaded from %s", path)
+        logger.info("Preprocessor loaded ← %s", path)
         return inst
-
-
-if __name__ == "__main__":
-    from data_loader import generate_synthetic_data
-    df = generate_synthetic_data(n_samples=5000)
-    p = PreprocessingPipeline()
-    X_tr, X_v, X_te, y_tr, y_v, y_te = p.fit_transform(df)
-    print(f"Train: {X_tr.shape} | Val: {X_v.shape} | Test: {X_te.shape}")
-    p.save()
