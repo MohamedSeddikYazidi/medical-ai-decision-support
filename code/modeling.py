@@ -1,13 +1,16 @@
 """
-modeling.py
-===========
-Model registry and hyperparameter search grids.
+modeling.py  (v2)
+=================
+Adds LightGBM as the 4th model — typically the strongest performer on
+tabular clinical data due to leaf-wise growth, native categorical support,
+and built-in class-weight handling.
 
-Provides
---------
-  get_models()           -> dict[str, estimator]
-  get_param_grids()      -> dict[str, dict]
-  build_model_pipeline() -> sklearn Pipeline wrapping an estimator
+Models
+------
+  logistic_regression  – linear baseline, fast, interpretable
+  random_forest        – bagging ensemble, robust
+  xgboost              – depth-wise gradient boosting
+  lightgbm  ★ NEW      – leaf-wise gradient boosting, usually best AUC
 """
 
 import logging
@@ -15,27 +18,18 @@ from typing import Dict, Any
 
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.pipeline import Pipeline
 from xgboost import XGBClassifier
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Model definitions
-# ─────────────────────────────────────────────────────────────────────────────
 def get_models(random_state: int = 42) -> Dict[str, Any]:
-    """
-    Return a dictionary of {model_name: unfitted estimator}.
-
-    All models are configured for binary classification with balanced
-    class weights where applicable.
-    """
-    models = {
+    models: Dict[str, Any] = {
         "logistic_regression": LogisticRegression(
-            max_iter=1000,
+            max_iter=5000,
             solver="saga",
+            tol=1e-3,
             class_weight="balanced",
             random_state=random_state,
             n_jobs=-1,
@@ -56,99 +50,70 @@ def get_models(random_state: int = 42) -> Dict[str, Any]:
             verbosity=0,
         ),
     }
+
+    # LightGBM — optional but strongly recommended
+    try:
+        import lightgbm as lgb
+        models["lightgbm"] = lgb.LGBMClassifier(
+            objective="binary",
+            metric="auc",
+            boosting_type="gbdt",
+            n_estimators=500,
+            learning_rate=0.05,
+            num_leaves=63,
+            max_depth=-1,
+            min_child_samples=20,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            class_weight="balanced",
+            random_state=random_state,
+            n_jobs=-1,
+            verbose=-1,
+        )
+        logger.info("LightGBM loaded ✓")
+    except ImportError:
+        logger.warning("lightgbm not installed. Install with: pip install lightgbm")
+
     logger.info("Models registered: %s", list(models.keys()))
     return models
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Hyperparameter grids
-# ─────────────────────────────────────────────────────────────────────────────
 def get_param_grids() -> Dict[str, Dict[str, list]]:
-    """
-    Hyperparameter grids for GridSearchCV.
-
-    Grids are intentionally compact to allow full cross-validation within
-    practical time constraints while still exploring meaningful ranges.
-    """
-    grids = {
+    """Full hyperparameter grids (used with --full flag)."""
+    grids: Dict[str, Dict[str, list]] = {
         "logistic_regression": {
             "C": [0.01, 0.1, 1.0, 10.0],
-            "penalty": ["l1", "l2"],
+            "penalty": ["l2"],
         },
         "random_forest": {
-            "n_estimators": [100, 300],
+            "n_estimators": [200, 400],
             "max_depth": [None, 10, 20],
             "min_samples_split": [2, 5],
             "max_features": ["sqrt", "log2"],
         },
         "xgboost": {
-            "n_estimators": [100, 300],
-            "max_depth": [3, 6],
-            "learning_rate": [0.05, 0.1, 0.2],
+            "n_estimators": [200, 400],
+            "max_depth": [4, 6],
+            "learning_rate": [0.05, 0.1],
             "subsample": [0.8, 1.0],
-            "colsample_bytree": [0.8, 1.0],
-            "scale_pos_weight": [1, 5, 9],   # compensate imbalance
+            "scale_pos_weight": [5, 8],
+        },
+        "lightgbm": {
+            "n_estimators": [300, 500],
+            "num_leaves": [31, 63, 127],
+            "learning_rate": [0.05, 0.1],
+            "min_child_samples": [10, 20],
+            "scale_pos_weight": [5, 8],
         },
     }
     return grids
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Convenience builder
-# ─────────────────────────────────────────────────────────────────────────────
-def build_model_pipeline(model_name: str, random_state: int = 42) -> Any:
-    """
-    Retrieve a single estimator by name.
-
-    Parameters
-    ----------
-    model_name   : one of 'logistic_regression', 'random_forest', 'xgboost'
-    random_state : reproducibility seed
-
-    Returns
-    -------
-    sklearn-compatible estimator
-    """
-    models = get_models(random_state=random_state)
-    if model_name not in models:
-        raise ValueError(
-            f"Unknown model '{model_name}'. "
-            f"Available: {list(models.keys())}"
-        )
-    return models[model_name]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Model metadata helpers (used in MLflow logging)
-# ─────────────────────────────────────────────────────────────────────────────
 def model_metadata(model_name: str) -> Dict[str, str]:
-    """Return a dict of static metadata tags for MLflow."""
     meta = {
-        "logistic_regression": {
-            "framework": "scikit-learn",
-            "family": "linear",
-            "interpretability": "high",
-        },
-        "random_forest": {
-            "framework": "scikit-learn",
-            "family": "ensemble",
-            "interpretability": "medium",
-        },
-        "xgboost": {
-            "framework": "xgboost",
-            "family": "gradient_boosting",
-            "interpretability": "medium",
-        },
+        "logistic_regression": {"framework": "scikit-learn", "family": "linear"},
+        "random_forest":       {"framework": "scikit-learn", "family": "ensemble"},
+        "xgboost":             {"framework": "xgboost",      "family": "gradient_boosting"},
+        "lightgbm":            {"framework": "lightgbm",     "family": "gradient_boosting"},
     }
     return meta.get(model_name, {})
-
-
-if __name__ == "__main__":
-    models = get_models()
-    grids = get_param_grids()
-    for name, model in models.items():
-        grid = grids.get(name, {})
-        n_combos = 1
-        for v in grid.values():
-            n_combos *= len(v)
-        print(f"{name:30s} | params: {n_combos:4d} combinations")
