@@ -103,7 +103,7 @@ def get_param_grids() -> Dict[str, Dict[str, list]]:
             "num_leaves": [31, 63, 127],
             "learning_rate": [0.05, 0.1],
             "min_child_samples": [10, 20],
-            "scale_pos_weight": [5, 8],
+            # LightGBM uses class_weight='balanced' (set in constructor), not scale_pos_weight
         },
     }
     return grids

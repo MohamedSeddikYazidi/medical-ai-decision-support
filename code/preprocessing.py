@@ -22,7 +22,7 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.preprocessing import OneHotEncoder, RobustScaler
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -97,7 +97,7 @@ def build_column_transformer(cat_features: List[str], num_features: List[str]) -
             ]), cat_features),
             ("num", Pipeline([
                 ("imputer", SimpleImputer(strategy="median")),
-                ("scaler", StandardScaler()),
+                ("scaler", RobustScaler()),  # robust to outliers (extreme lab/med counts)
             ]), num_features),
         ],
         remainder="drop",
@@ -120,6 +120,7 @@ class PreprocessingPipeline:
         self.num_features_: List[str] = []
         self.feature_names_out_: List[str] = []
         self._fitted = False
+        self._CLIP_BOUNDS: dict = {}   # instance variable — NOT shared across instances
 
     def _detect_feature_lists(self, df: pd.DataFrame) -> None:
         # ── KEY FIX: include engineered features in numerical list ────────────
@@ -153,6 +154,12 @@ class PreprocessingPipeline:
             random_state=self.random_state, stratify=y_temp,
         )
         logger.info("Split: train=%d | val=%d | test=%d", len(X_train), len(X_val), len(X_test))
+
+        # ── Record safe input bounds (used for clipping at inference) ──────────
+        for c in self.num_features_:
+            if c in X_train.columns:
+                col = pd.to_numeric(X_train[c], errors="coerce")
+                self._CLIP_BOUNDS[c] = (col.min(), col.max() * 3)
 
         # ── Encode + scale ─────────────────────────────────────────────────────
         self.transformer = build_column_transformer(self.cat_features_, self.num_features_)
@@ -193,9 +200,15 @@ class PreprocessingPipeline:
             raise RuntimeError("Pipeline not fitted. Call fit_transform first.")
         all_features = self.cat_features_ + self.num_features_
         df = df.copy()
+        # Fill missing columns with NaN (safe default)
         for c in all_features:
             if c not in df.columns:
                 df[c] = np.nan
+        # Clip numerical inputs to 3× the training max to prevent runaway scores
+        for c in self.num_features_:
+            if c in df.columns and c in self._CLIP_BOUNDS:
+                lo, hi = self._CLIP_BOUNDS[c]
+                df[c] = pd.to_numeric(df[c], errors="coerce").clip(lo, hi)
         df = self.grouper.transform(df)
         return self.transformer.transform(df[all_features])
 
@@ -207,6 +220,7 @@ class PreprocessingPipeline:
             "cat_features":      self.cat_features_,
             "num_features":      self.num_features_,
             "feature_names_out": self.feature_names_out_,
+            "clip_bounds":       self._CLIP_BOUNDS,
         }, path)
         logger.info("Preprocessor saved → %s", path)
 
@@ -219,6 +233,7 @@ class PreprocessingPipeline:
         inst.cat_features_      = payload["cat_features"]
         inst.num_features_      = payload["num_features"]
         inst.feature_names_out_ = payload["feature_names_out"]
+        inst._CLIP_BOUNDS        = payload.get("clip_bounds", {})
         inst._fitted = True
         logger.info("Preprocessor loaded ← %s", path)
         return inst

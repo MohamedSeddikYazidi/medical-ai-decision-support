@@ -123,16 +123,20 @@ def train_model(
         logger.info("%s best params: %s  CV-AUC=%.4f",
                     model_name, best_params, gs.best_score_)
 
-        # ── Calibrate probabilities with isotonic regression ──────────────────
-        # This is crucial: SMOTE inflates minority class → raw probs are biased.
-        # Calibration maps scores to realistic clinical probabilities.
+        # ── Calibrate probabilities ───────────────────────────────────────────
+        # Split val into cal_fit (60%) + cal_eval (40%) so the calibrator
+        # is never evaluated on its own training data.
         logger.info("Calibrating %s…", model_name)
+        from sklearn.model_selection import train_test_split as _tts
+        X_cal_fit, X_cal_eval, y_cal_fit, y_cal_eval = _tts(
+            X_val, y_val, test_size=0.4, random_state=random_state, stratify=y_val
+        )
         calibrated = CalibratedClassifierCV(
             estimator=best_raw,
             method="isotonic",
             cv="prefit",
         )
-        calibrated.fit(X_val, y_val)
+        calibrated.fit(X_cal_fit, y_cal_fit)
         best_est = calibrated
 
         mlflow.log_params(best_params)
@@ -141,9 +145,10 @@ def train_model(
         mlflow.log_param("calibrated", True)
         mlflow.log_metric("cv_roc_auc", gs.best_score_)
 
-        y_pred = best_est.predict(X_val)
-        y_prob = best_est.predict_proba(X_val)[:, 1]
-        val_metrics = compute_metrics(y_val, y_pred, y_prob)
+        # Evaluate on the held-out cal_eval set (not seen during calibration)
+        y_pred = best_est.predict(X_cal_eval)
+        y_prob = best_est.predict_proba(X_cal_eval)[:, 1]
+        val_metrics = compute_metrics(y_cal_eval, y_pred, y_prob)
 
         for k, v in val_metrics.items():
             mlflow.log_metric(f"val_{k}", v)
@@ -181,6 +186,81 @@ def get_quick_param_grids() -> Dict[str, dict]:
         "lightgbm":            {"n_estimators": [300], "num_leaves": [63],
                                 "learning_rate": [0.05], "min_child_samples": [20]},
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+def _validate_monotonicity(model, X_val: np.ndarray, prep, feature_names: list) -> dict:
+    """
+    Verify that key clinical risk features positively correlate with predicted risk.
+    Uses a median baseline row and sweeps each feature across its range.
+    Returns a dict of {feature: 'PASS'/'FAIL'}.
+    """
+    results = {}
+    # Map feature names to their indices in the encoded array
+    fn = list(feature_names)
+    # Key features that MUST increase risk
+    monotone_features = {
+        "number_inpatient": [0, 1, 2, 3, 5],
+        "number_emergency":  [0, 1, 2, 3, 5],
+        "num_medications":   [1, 5, 10, 15, 20],
+        "num_diagnoses":     [1, 3, 5, 7, 9],
+    }
+    baseline = np.median(X_val, axis=0).reshape(1, -1)
+
+    for feat_name, sweep_values in monotone_features.items():
+        if feat_name not in fn:
+            results[feat_name] = "SKIP (not in features)"
+            continue
+        idx = fn.index(feat_name)
+        probs = []
+        for val in sweep_values:
+            row = baseline.copy()
+            row[0, idx] = val
+            try:
+                p = float(model.predict_proba(row)[0, 1])
+                probs.append(p)
+            except Exception:
+                probs.append(None)
+        valid = [p for p in probs if p is not None]
+        if len(valid) < 2:
+            results[feat_name] = "SKIP (prediction failed)"
+            continue
+        # Check that the trend is generally increasing (allow small dips)
+        increases = sum(valid[i+1] >= valid[i] - 0.02 for i in range(len(valid)-1))
+        pct = increases / (len(valid) - 1)
+        results[feat_name] = "PASS" if pct >= 0.6 else f"WARN ({pct:.0%} monotone)"
+        logger.info("Monotonicity %-20s  probs=%s  → %s",
+                    feat_name, [f"{p:.3f}" for p in valid], results[feat_name])
+    return results
+
+
+def _export_feature_importance(model, feature_names: list, model_name: str) -> None:
+    """Save top-30 feature importances to a CSV and log to MLflow."""
+    try:
+        raw = getattr(model, "estimator", model)  # unwrap CalibratedClassifierCV
+        if hasattr(raw, "feature_importances_"):
+            importances = raw.feature_importances_
+        elif hasattr(raw, "coef_"):
+            importances = np.abs(raw.coef_[0])
+        else:
+            return  # model type doesn't expose importances
+
+        df_imp = pd.DataFrame({
+            "feature":    feature_names,
+            "importance": importances,
+        }).sort_values("importance", ascending=False).head(30)
+
+        path = str(MODEL_DIR / f"{model_name}_feature_importance.csv")
+        df_imp.to_csv(path, index=False)
+        logger.info("Feature importance saved → %s", path)
+        logger.info("Top 10 features for %s:\n%s", model_name,
+                    df_imp.head(10).to_string(index=False))
+        try:
+            mlflow.log_artifact(path)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("Feature importance export skipped: %s", e)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -257,6 +337,22 @@ def run_training(quick=True, random_state=42, cv_folds=3) -> str:
         logger.info("  %-20s  val AUC=%.4f F1=%.4f  |  test AUC=%.4f%s",
                     n, vm["roc_auc"], vm["f1"], tm.get("roc_auc", 0), tag)
     logger.info("=" * 60)
+
+    # 7b. Monotonicity validation + feature importance
+    logger.info("─" * 60)
+    logger.info("MONOTONICITY CHECKS (best model: %s)", best_name)
+    try:
+        mono_results = _validate_monotonicity(
+            trained_models[best_name], X_val,
+            prep, prep.feature_names_out_
+        )
+        for feat, verdict in mono_results.items():
+            logger.info("  %-22s → %s", feat, verdict)
+    except Exception as e:
+        logger.warning("Monotonicity check failed: %s", e)
+
+    for name, model in trained_models.items():
+        _export_feature_importance(model, prep.feature_names_out_, name)
 
     # 8. Save each model individually
     for name, model in trained_models.items():

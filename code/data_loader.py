@@ -101,6 +101,9 @@ def load_data(path: str = LOCAL_PATH) -> pd.DataFrame:
 
     df = _replace_missing_markers(df)
     df = _drop_irrelevant_columns(df)
+    # Normalise column name: dataset uses 'number_diagnoses', our pipeline uses 'num_diagnoses'
+    if "number_diagnoses" in df.columns and "num_diagnoses" not in df.columns:
+        df = df.rename(columns={"number_diagnoses": "num_diagnoses"})
     df = _convert_target(df)
 
     # Keep only the features we care about + target
@@ -156,24 +159,40 @@ def generate_synthetic_data(n_samples: int = 5000, random_state: int = 42) -> pd
     insulin_vals = ["No", "Steady", "Up", "Down"]
 
     df = pd.DataFrame({
+        # Demographics
         "race": rng.choice(["Caucasian", "AfricanAmerican", "Hispanic", "Other", np.nan],
                            n_samples, p=[0.75, 0.19, 0.02, 0.02, 0.02]),
         "gender": rng.choice(["Male", "Female", "Unknown/Invalid"], n_samples,
                              p=[0.46, 0.53, 0.01]),
         "age": rng.choice(age_brackets, n_samples),
-        "time_in_hospital": rng.integers(1, 14, n_samples),
+        # Encounter
+        "time_in_hospital":   rng.integers(1, 14, n_samples),
         "num_lab_procedures": rng.integers(1, 120, n_samples),
-        "num_procedures": rng.integers(0, 7, n_samples),
-        "num_medications": rng.integers(1, 81, n_samples),
-        "number_outpatient": rng.integers(0, 42, n_samples),
-        "number_emergency": rng.integers(0, 76, n_samples),
-        "number_inpatient": rng.integers(0, 21, n_samples),
+        "num_procedures":     rng.integers(0, 7, n_samples),
+        "num_medications":    rng.integers(1, 81, n_samples),
+        "number_outpatient":  rng.integers(0, 15, n_samples),
+        "number_emergency":   rng.integers(0, 5, n_samples),
+        "number_inpatient":   rng.integers(0, 10, n_samples),
+        "num_diagnoses":      rng.integers(1, 9, n_samples),   # ← was missing
+        # Diagnoses
         "diag_1": rng.choice(diag_codes, n_samples),
         "diag_2": rng.choice(diag_codes + [np.nan], n_samples),
         "diag_3": rng.choice(diag_codes + [np.nan], n_samples),
-        "insulin": rng.choice(insulin_vals, n_samples),
-        "change": rng.choice(["Ch", "No"], n_samples),
-        "diabetesMed": rng.choice(["Yes", "No"], n_samples),
+        # Lab results  ← were all missing
+        "A1Cresult":     rng.choice(["None", ">7", ">8", "Norm"], n_samples,
+                                     p=[0.83, 0.06, 0.06, 0.05]),
+        "max_glu_serum": rng.choice(["None", ">200", ">300", "Norm"], n_samples,
+                                     p=[0.95, 0.02, 0.01, 0.02]),
+        # Admission / discharge context  ← were missing
+        "admission_type_id":        rng.choice([1, 2, 3, 5], n_samples,
+                                                p=[0.49, 0.23, 0.17, 0.11]),
+        "discharge_disposition_id": rng.choice([1, 2, 3, 5, 6], n_samples,
+                                                 p=[0.56, 0.02, 0.14, 0.03, 0.25]),
+        # Medications
+        "insulin":     rng.choice(["No", "Steady", "Up", "Down"], n_samples,
+                                    p=[0.47, 0.36, 0.09, 0.08]),
+        "change":      rng.choice(["Ch", "No"], n_samples, p=[0.54, 0.46]),
+        "diabetesMed": rng.choice(["Yes", "No"], n_samples, p=[0.77, 0.23]),
         TARGET: rng.choice([0, 1], n_samples, p=[0.89, 0.11]),
     })
     return df
