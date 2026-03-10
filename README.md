@@ -551,4 +551,4 @@ pytest tests/ -v --tb=short
 
 ---
 
-*Built with ❤️ for healthcare AI — Python · scikit-learn · XGBoost · MLflow · FastAPI · React · Docker*
+*Built with ❤️ for healthcare AI — by Achref and Seddik
