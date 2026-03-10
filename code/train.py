@@ -29,6 +29,11 @@ import pandas as pd
 import mlflow
 import mlflow.sklearn
 import mlflow.xgboost
+try:
+    import mlflow.lightgbm as mlflow_lightgbm
+    _MLFLOW_LIGHTGBM = True
+except ImportError:
+    _MLFLOW_LIGHTGBM = False
 
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
@@ -56,7 +61,7 @@ MLRUNS_DIR.mkdir(exist_ok=True)
 BEST_MODEL_PATH = str(MODEL_DIR / "best_model.joblib")
 RESULTS_PATH    = str(MODEL_DIR / "training_results.json")
 
-
+# Windows-safe MLflow URI (file:///C:/... on Win, file:///home/... on Unix)
 MLFLOW_URI      = os.getenv("MLFLOW_TRACKING_URI", MLRUNS_DIR.as_uri())
 EXPERIMENT_NAME = "diabetes_readmission_v1"
 logger.info("MLflow URI: %s", MLFLOW_URI)
@@ -151,9 +156,8 @@ def train_model(
         try:
             if model_name == "xgboost":
                 mlflow.xgboost.log_model(best_raw, artifact_path="model_raw")
-            elif model_name == "lightgbm":
-                import mlflow.lightgbm
-                mlflow.lightgbm.log_model(best_raw, artifact_path="model_raw")
+            elif model_name == "lightgbm" and _MLFLOW_LIGHTGBM:
+                mlflow_lightgbm.log_model(best_raw, artifact_path="model_raw")
             else:
                 mlflow.sklearn.log_model(best_est, artifact_path="model")
         except Exception as e:
